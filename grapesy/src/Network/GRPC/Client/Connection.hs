@@ -311,6 +311,24 @@ data Server =
 
     -- | Make a local connection over a Unix domain socket
   | ServerUnix FilePath
+
+    -- | Adopt an already-connected socket and speak h2c over it.
+    --
+    -- PULSE FORK (see PULSE-FORK.md). Unlike every other constructor, grapesy
+    -- does /not/ dial here: the socket is already connected (by whoever hands
+    -- it in) and grapesy runs an insecure (h2c) client directly over it. The
+    -- 'String' is the HTTP\/2 @:authority@ to send.
+    --
+    -- This is what lets a peer act as the gRPC /client/ over a connection the
+    -- other side /dialed/ (reverse gRPC): the Pulse collector dials out and
+    -- serves gRPC on the socket, the appliance accepts it and adopts it here.
+    -- Any TLS is terminated in front of the socket (nginx forwards plaintext
+    -- h2c), so the insecure path is correct.
+    --
+    -- The socket is single-use: grapesy consumes it and it cannot be re-dialed,
+    -- so pair this with a non-reconnecting 'ReconnectPolicy'. Open a fresh
+    -- 'Connection' from the next accepted socket instead of reconnecting.
+  | ServerFromSocket Socket String
   deriving stock (Show)
 
 {-------------------------------------------------------------------------------
@@ -513,6 +531,9 @@ stayConnected connParams initialServer connStateVar connOutOfScope = do
               connectSecure connParams attempt validation sslKeyLog addr
             ServerUnix path ->
               connectUnix connParams attempt path
+            ServerFromSocket sock connAuthority ->
+              -- PULSE FORK: no dial; run the h2c client over the adopted socket.
+              connectSocket connParams attempt connAuthority sock
 
         thisReconnectPolicy <- atomically $ do
           putTMVar (attemptClosed attempt) $ either Just (\() -> Nothing) mRes
