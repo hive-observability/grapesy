@@ -2,6 +2,7 @@ module Network.GRPC.Client (
     -- * Connecting to the server
     Connection -- opaque
   , Server(..)
+  , StreamIO(..)
   , ConnParams(..)
   , withConnection
   , openConnection
