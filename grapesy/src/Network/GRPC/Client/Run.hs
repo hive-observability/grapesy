@@ -206,6 +206,9 @@ stayConnected connParams initialServer connStateVar connOutOfScope = do
               connectSecure connParams attempt validation sslKeyLog addr
             ServerUnix path ->
               connectUnix connParams attempt path
+            ServerFromSocket sock connAuthority ->
+              -- PULSE FORK: no dial; run the h2c client over the adopted socket.
+              connectSocket connParams attempt connAuthority sock
 
         thisReconnectPolicy <- atomically $ do
           STM.putTMVar (attemptClosed attempt) $ either Just (\() -> Nothing) mRes
