@@ -231,6 +231,9 @@ stayConnected connParams initialServer connStateVar connOutOfScope = do
               connectSecure connParams attempt validation sslKeyLog addr
             ServerUnix path ->
               connectUnix connParams attempt path
+            ServerFromSocket sock connAuthority ->
+              -- PULSE FORK: no dial; run the h2c client over the adopted socket.
+              connectSocket connParams attempt connAuthority sock
 
         -- The connection failing does not imply that it wasn't /also/ closed;
         -- if that is the case, we should not try to reconnect.
