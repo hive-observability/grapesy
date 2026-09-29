@@ -13,6 +13,7 @@ module Network.GRPC.Client.Connection (
   , ConnectionState(..)
     -- * Configuration
   , Server(..)
+  , StreamIO(..)
   , ServerValidation(..)
   , SslKeyLog(..)
   , ConnParams(..)
@@ -33,7 +34,8 @@ import Network.GRPC.Util.Imports
 import Control.Concurrent.MVar (MVar, readMVar, modifyMVar_)
 import Control.Concurrent.STM (TVar, TMVar)
 import Control.Concurrent.STM qualified as STM
-import Network.Socket (Socket)
+import Data.ByteString (ByteString)
+import Network.Socket (SockAddr, Socket)
 import System.Random (randomRIO)
 
 import Network.GRPC.Client.Meta (Meta)
@@ -309,7 +311,43 @@ data Server =
     -- a fresh 'Connection' from the next accepted socket instead of
     -- reconnecting.
   | ServerFromSocket Socket String
+
+    -- | Adopt an already-established byte stream and speak h2c over it.
+    --
+    -- PULSE FORK. 'ServerFromSocket' for a connection that is not (or not
+    -- directly) a 'Socket': grapesy runs an insecure (h2c) client over the
+    -- 'StreamIO' callbacks. This is what lets the Pulse cloud instance adopt
+    -- a connection Warp handed it via @responseRaw@ after an HTTP\/1.1
+    -- @Upgrade@ handshake (hive-observability/pulse#2017): after the @101@
+    -- the raw @recv@\/@send@ pair carries exactly the bytes a dialed socket
+    -- would.
+    --
+    -- The two 'SockAddr's are the local and peer addresses, in that order;
+    -- http2 only stores them, so they are informational (pass the real peer
+    -- for the benefit of future logging). The 'String' is the HTTP\/2
+    -- @:authority@ to send.
+    --
+    -- Like 'ServerFromSocket' the stream is single-use: the reconnect policy
+    -- MUST stay 'DontReconnect' (the default), since a reconnect would re-run
+    -- the client over an already-consumed stream.
+  | ServerFromStream StreamIO SockAddr SockAddr String
   deriving stock (Show)
+
+-- | The two ends of an established byte stream, for 'ServerFromStream'.
+--
+-- PULSE FORK. @recv@ returns the next chunk (of whatever size), and MUST
+-- return 'Data.ByteString.empty' -- and keep returning it, without blocking
+-- or throwing -- once the peer has closed; that empty read is how http2 sees
+-- EOF and ends the connection. @send@ must write the whole chunk. Warp's
+-- raw-response @recv@\/@send@ pair satisfies both contracts as is.
+data StreamIO = StreamIO {
+      recv :: IO ByteString
+    , send :: ByteString -> IO ()
+    }
+
+-- | 'Server' derives 'Show'; function fields cannot, so summarize.
+instance Show StreamIO where
+  show _ = "StreamIO"
 
 {-------------------------------------------------------------------------------
   Making use of the connection

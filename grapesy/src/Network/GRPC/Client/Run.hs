@@ -11,6 +11,7 @@ module Network.GRPC.Client.Run (
   , closeConnection
     -- * Configuration
   , Server(..)
+  , StreamIO(..)
   , ServerValidation(..)
   , SslKeyLog(..)
   , ConnParams(..)
@@ -34,13 +35,19 @@ import Network.GRPC.Util.Imports
 import Control.Concurrent.MVar (MVar, newMVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, TMVar)
 import Control.Concurrent.STM qualified as STM
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Foreign.Marshal.Alloc (mallocBytes)
 import Network.HPACK qualified as HPACK
 import Network.HTTP2.Client qualified as HTTP2.Client
+import Network.HTTP2.Client.Internal qualified as HTTP2.Internal
 import Network.HTTP2.TLS.Client qualified as HTTP2.TLS.Client
 import Network.Run.TCP qualified as Run
-import Network.Socket (Socket, AddrInfo, StructLinger (..), SocketOption (..), SockOptValue (..))
+import Network.Socket (Socket, AddrInfo, SockAddr, StructLinger (..), SocketOption (..), SockOptValue (..))
 import Network.Socket qualified as Socket
 import Network.TLS (TLSException)
+import System.TimeManager qualified as T
 
 import Network.GRPC.Client.Meta qualified as Meta
 import Network.GRPC.Common.Exception
@@ -209,6 +216,9 @@ stayConnected connParams initialServer connStateVar connOutOfScope = do
             ServerFromSocket sock connAuthority ->
               -- PULSE FORK: no dial; run the h2c client over the adopted socket.
               connectSocket connParams attempt connAuthority sock
+            ServerFromStream stream myAddr peerAddr connAuthority ->
+              -- PULSE FORK: no dial; run the h2c client over the byte stream.
+              connectStream connParams attempt connAuthority stream myAddr peerAddr
 
         thisReconnectPolicy <- atomically $ do
           STM.putTMVar (attemptClosed attempt) $ either Just (\() -> Nothing) mRes
@@ -308,6 +318,115 @@ connectSocket connParams attempt connAuthority sock = do
                 fromIntegral $
                   http2ConnectionWindowSize connHTTP2Settings
           }
+
+-- | Insecure connection over an already-established byte stream
+--
+-- PULSE FORK. The moral equivalent of 'connectSocket' when the connection is
+-- a pair of callbacks rather than a 'Socket': we build the http2 'Config' by
+-- hand -- 'HTTP2.Client.allocSimpleConfig' needs a 'Socket' -- and release it
+-- with the upstream 'HTTP2.Client.freeSimpleConfig', which frees exactly what
+-- we allocate here (the @malloc@ed write buffer and the timeout manager).
+--
+-- @http2@ exports 'HTTP2.Client.Config' abstractly, so we start from
+-- 'HTTP2.Client.defaultConfig' and override through the field selectors in
+-- @Network.HTTP2.Client.Internal@: fields @http2@ adds later then keep their
+-- defaults instead of breaking this call.
+connectStream ::
+     ConnParams
+  -> Attempt
+  -> String
+  -> StreamIO
+  -> SockAddr  -- ^ Local address (informational)
+  -> SockAddr  -- ^ Peer address (informational)
+  -> IO ()
+connectStream connParams attempt connAuthority stream myAddr peerAddr = do
+    bracket allocConfig HTTP2.Client.freeSimpleConfig $ \conf ->
+      HTTP2.Client.run clientConfig conf $ \sendRequest _aux -> do
+        let conn = Session.ConnectionToServer sendRequest
+        atomically $
+          STM.writeTVar (attemptState attempt) $
+            ConnectionReady (attemptClosed attempt) conn
+        runOnConnection $ attemptOnConnection attempt
+        takeMVar $ attemptOutOfScope attempt
+  where
+    ConnParams{connHTTP2Settings} = connParams
+
+    allocConfig :: IO HTTP2.Client.Config
+    allocConfig = do
+        -- The buffer must come from 'mallocBytes' ('freeSimpleConfig' 'free's
+        -- it); its size is announced to the peer as SETTINGS_MAX_FRAME_SIZE.
+        writeBuffer <- mallocBytes writeBufferSize
+        -- Same 30s manager 'allocSimpleConfig' makes; the client registers no
+        -- handles with it, it exists to satisfy the record.
+        timeoutManager <- T.initialize (30 * 1000000)
+        readN <- mkStreamReadN (recv stream)
+        return HTTP2.Client.defaultConfig {
+            HTTP2.Internal.confWriteBuffer = writeBuffer
+          , HTTP2.Internal.confBufferSize = writeBufferSize
+          , HTTP2.Internal.confSendAll = send stream
+          , HTTP2.Internal.confReadN = readN
+          , HTTP2.Internal.confTimeoutManager = timeoutManager
+          , HTTP2.Internal.confMySockAddr = myAddr
+          , HTTP2.Internal.confPeerSockAddr = peerAddr
+          }
+
+    settings :: HTTP2.Client.Settings
+    settings = HTTP2.Client.defaultSettings {
+          HTTP2.Client.maxConcurrentStreams =
+              Just . fromIntegral $
+                http2MaxConcurrentStreams connHTTP2Settings
+        , HTTP2.Client.initialWindowSize =
+              fromIntegral $
+                http2StreamWindowSize connHTTP2Settings
+        }
+
+    clientConfig :: HTTP2.Client.ClientConfig
+    clientConfig = overrideRateLimits connParams $
+        HTTP2.Client.defaultClientConfig {
+            HTTP2.Client.authority = connAuthority
+          , HTTP2.Client.settings = settings
+          , HTTP2.Client.connectionWindowSize =
+                fromIntegral $
+                  http2ConnectionWindowSize connHTTP2Settings
+          }
+
+-- | @confReadN@ over an abstract @recv@: exactly @n@ bytes, or 'BS.empty'.
+--
+-- PULSE FORK. Matches the contract of http2's @defaultReadN@: return exactly
+-- @n@ bytes, buffering any excess for the next call -- or, as soon as @recv@
+-- returns empty before @n@ bytes have accumulated, return 'BS.empty' and
+-- discard the partial data. http2 treats the empty read as EOF and ends the
+-- connection. Deliberately NOT a loop-until-@n@: a @recv@ like Warp's returns
+-- empty forever once the peer closes, and an adapter that kept asking would
+-- spin at 100% CPU.
+mkStreamReadN :: IO ByteString -> IO (Int -> IO ByteString)
+mkStreamReadN recvChunk = do
+    leftoverRef <- newIORef BS.empty
+    return $ \n -> do
+      leftover <- readIORef leftoverRef
+      if BS.length leftover >= n
+        then do
+          let (bs, rest) = BS.splitAt n leftover
+          writeIORef leftoverRef rest
+          return bs
+        else fill leftoverRef [leftover] (BS.length leftover) n
+  where
+    fill :: IORef ByteString -> [ByteString] -> Int -> Int -> IO ByteString
+    fill leftoverRef acc len n = do
+        chunk <- recvChunk
+        if BS.null chunk
+          then do
+            -- EOF before n bytes: report EOF, drop the partial data.
+            writeIORef leftoverRef BS.empty
+            return BS.empty
+          else do
+            let len' = len + BS.length chunk
+            if len' >= n
+              then do
+                let (bs, rest) = BS.splitAt n (BS.concat (reverse (chunk : acc)))
+                writeIORef leftoverRef rest
+                return bs
+              else fill leftoverRef (chunk : acc) len' n
 
 -- | Secure connection (using TLS)
 connectSecure ::
