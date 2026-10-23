@@ -54,6 +54,7 @@ import Network.GRPC.Common.Exception
 import Network.GRPC.Common.HTTP2Settings
 import Network.GRPC.Util.GHC
 import Network.GRPC.Util.Session.Client qualified as Session
+import Network.GRPC.Util.TimeManager (clientIdleTimeoutMicros)
 import Network.GRPC.Util.TLS qualified as Util.TLS
 
 {-------------------------------------------------------------------------------
@@ -287,7 +288,8 @@ connectInsecure connParams attempt addr = do
 -- | Insecure connection over the given socket
 connectSocket :: ConnParams -> Attempt -> String -> Socket -> IO ()
 connectSocket connParams attempt connAuthority sock = do
-    bracket (HTTP2.Client.allocSimpleConfig sock writeBufferSize)
+    bracket (HTTP2.Client.allocSimpleConfig' sock writeBufferSize
+                                             clientIdleTimeoutMicros)
             HTTP2.Client.freeSimpleConfig $ \conf ->
       HTTP2.Client.run clientConfig conf $ \sendRequest _aux -> do
         let conn = Session.ConnectionToServer sendRequest
@@ -356,9 +358,12 @@ connectStream connParams attempt connAuthority stream myAddr peerAddr = do
         -- The buffer must come from 'mallocBytes' ('freeSimpleConfig' 'free's
         -- it); its size is announced to the peer as SETTINGS_MAX_FRAME_SIZE.
         writeBuffer <- mallocBytes writeBufferSize
-        -- Same 30s manager 'allocSimpleConfig' makes; the client registers no
-        -- handles with it, it exists to satisfy the record.
-        timeoutManager <- T.initialize (30 * 1000000)
+        -- The same manager the socket path gets from
+        -- 'HTTP2.Client.allocSimpleConfig''. Load-bearing, not a field-filler:
+        -- @http2@'s frame receiver registers a handle on it and reaps the
+        -- connection after that much INBOUND silence -- see
+        -- 'clientIdleTimeoutMicros'.
+        timeoutManager <- T.initialize clientIdleTimeoutMicros
         readN <- mkStreamReadN (recv stream)
         return HTTP2.Client.defaultConfig {
             HTTP2.Internal.confWriteBuffer = writeBuffer
