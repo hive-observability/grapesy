@@ -390,13 +390,14 @@ connectStream ::
   -> IO ()
 connectStream connParams attempt connAuthority stream myAddr peerAddr = do
     bracket allocConfig HTTP2.Client.freeSimpleConfig $ \conf ->
-      HTTP2.Client.run clientConfig conf $ \sendRequest _aux -> do
-        let conn = Session.ConnectionToServer sendRequest
-        atomically $
-          STM.writeTVar (attemptState attempt) $
-            ConnectionReady (attemptClosed attempt) conn
-        runOnConnection $ attemptOnConnection attempt
-        takeMVar $ attemptOutOfScope attempt
+      HTTP2.Client.run clientConfig conf $ \sendRequest aux ->
+        withClientKeepAlivePing connHTTP2Settings aux $ do
+          let conn = Session.ConnectionToServer sendRequest
+          atomically $
+            STM.writeTVar (attemptState attempt) $
+              ConnectionReady (attemptClosed attempt) conn
+          runOnConnection $ attemptOnConnection attempt
+          takeMVar $ attemptOutOfScope attempt
   where
     ConnParams{connHTTP2Settings} = connParams
 
@@ -405,9 +406,14 @@ connectStream connParams attempt connAuthority stream myAddr peerAddr = do
         -- The buffer must come from 'mallocBytes' ('freeSimpleConfig' 'free's
         -- it); its size is announced to the peer as SETTINGS_MAX_FRAME_SIZE.
         writeBuffer <- mallocBytes writeBufferSize
-        -- Same 30s manager 'allocSimpleConfig' makes; the client registers no
-        -- handles with it, it exists to satisfy the record.
-        timeoutManager <- T.initialize (30 * 1000000)
+        -- Load-bearing, not a field-filler: @http2@'s frame receiver
+        -- registers a handle on this manager and reaps the connection after
+        -- that much INBOUND silence. 'Nothing' has to mean here what it means
+        -- on the socket path, i.e. the 30s 'allocSimpleConfig' installs.
+        timeoutManager <-
+          T.initialize $
+            fromMaybe http2DefaultClientIdleTimeout
+                      (http2ClientIdleTimeout connHTTP2Settings)
         readN <- mkStreamReadN (recv stream)
         return HTTP2.Client.defaultConfig {
             HTTP2.Internal.confWriteBuffer = writeBuffer
@@ -529,6 +535,37 @@ connectSecure connParams attempt validation sslKeyLog addr = do
       takeMVar $ attemptOutOfScope attempt
   where
     ConnParams{connHTTP2Settings} = connParams
+
+-- | The idle timeout 'HTTP2.Client.allocSimpleConfig' installs.
+--
+-- PULSE FORK. 'connectStream' builds its 'HTTP2.Client.Config' by hand, so it
+-- has to spell out what the socket path gets for free -- otherwise
+-- 'http2ClientIdleTimeout' = 'Nothing' would mean two different things
+-- depending on which 'Server' constructor was used.
+http2DefaultClientIdleTimeout :: Int
+http2DefaultClientIdleTimeout = 30 * 1_000_000
+
+-- | Run an action with @http2@'s keepalive @PING@ loop forked alongside it.
+--
+-- PULSE FORK. 'connectStream''s half of the upstream keepalive support, which
+-- wires 'connectSocket' only [#380]: same loop, same thread label, over a
+-- 'HTTP2.Client.Config' we build by hand rather than one
+-- 'HTTP2.Client.allocSimpleConfig'' makes. 'Nothing' forks nothing.
+--
+-- This matters more here than on the socket path: a 'ServerFromStream' client
+-- is the appliance talking to a remote collector, which is exactly the quiet
+-- long-lived connection the idle timer kills.
+withClientKeepAlivePing :: HTTP2Settings -> HTTP2.Client.Aux -> IO a -> IO a
+withClientKeepAlivePing settings aux action =
+    bracket (mapM (forkLabelled "grapesy:client:keepalive" . pingLoop)
+                  (http2ClientKeepAlivePingInterval settings))
+            (mapM_ killThread)
+            (\_ -> action)
+  where
+    pingLoop :: Int -> IO ()
+    pingLoop intervalMicros = forever $ do
+        threadDelay intervalMicros
+        HTTP2.Client.auxSendPing aux
 
 -- | Authority
 --
